@@ -1,0 +1,242 @@
+/************************************************************************
+Avalon-MM Interface VGA Text mode display
+
+Register Map:
+0x000-0x0257 : VRAM, 80x30 (2400 byte, 600 word) raster order (first column then row)
+0x258        : control register
+
+VRAM Format:
+X->
+[ 31  30-24][ 23  22-16][ 15  14-8 ][ 7    6-0 ]
+[IV3][CODE3][IV2][CODE2][IV1][CODE1][IV0][CODE0]
+
+IVn = Draw inverse glyph
+CODEn = Glyph code from IBM codepage 437
+
+Control Register Format:
+[[31-25][24-21][20-17][16-13][ 12-9][ 8-5 ][ 4-1 ][   0    ] 
+[[RSVD ][FGD_R][FGD_G][FGD_B][BKG_R][BKG_G][BKG_B][RESERVED]
+
+VSYNC signal = bit which flips on every Vsync (time for new frame), used to synchronize software
+BKG_R/G/B = Background color, flipped with foreground when IVn bit is set
+FGD_R/G/B = Foreground color, flipped with background when Inv bit is set
+
+************************************************************************/
+`define NUM_REGS 601 //80*30 characters / 4 characters per register
+`define CTRL_REG 600 //index of control register
+
+module vga_text_avl_interface (
+	// Avalon Clock Input, note this clock is also used for VGA, so this must be 50Mhz
+	// We can put a clock divider here in the future to make this IP more generalizable
+	input logic CLK,
+	
+	// Avalon Reset Input
+	input logic RESET,
+	
+	// Avalon-MM Slave Signals
+	input  logic AVL_READ,					// Avalon-MM Read
+	input  logic AVL_WRITE,					// Avalon-MM Write
+	input  logic AVL_CS,					// Avalon-MM Chip Select
+	input  logic [3:0] AVL_BYTE_EN,			// Avalon-MM Byte Enable
+	input  logic [11:0] AVL_ADDR,			// Avalon-MM Address
+	input  logic [31:0] AVL_WRITEDATA,		// Avalon-MM Write Data
+	output logic [31:0] AVL_READDATA,		// Avalon-MM Read Data
+	
+	// Exported Conduit (mapped to VGA port - make sure you export in Platform Designer)
+	output logic [3:0]  red, green, blue,	// VGA color channels (mapped to output pins in top-level)
+	output logic hs, vs						// VGA HS/VS
+);
+
+//logic [31:0] LOCAL_REG [`NUM_REGS]; // Registers
+//put other local variables here
+logic [9:0] drawX, drawY;
+logic [10:0] index;			// index in font ROM
+logic [7:0] charData;		// character data from font ROM
+//logic [9:0] xPos;
+//logic [9:0] yPos;
+logic [11:0] address;
+logic currentBit;
+logic inverse;
+logic pixel_clk;
+logic blank, sync;
+
+// ram init
+logic [31:0] ram_output;
+logic [11:0] ram_read_address;
+
+// palette init
+logic [31:0] PALETTE_REG [8];
+
+always_ff @(posedge CLK) begin
+	if(AVL_WRITE & AVL_ADDR[11])
+		PALETTE_REG[AVL_ADDR[2:0]] <= AVL_WRITEDATA;
+		
+	if(AVL_READ & AVL_ADDR[11])
+		AVL_READDATA <= PALETTE_REG[AVL_ADDR[2:0]];
+end
+
+//Declare submodules..e.g. VGA controller, ROMS, etc
+	vga_controller vc0 (
+		.Clk(CLK),
+		.Reset(RESET),
+		.hs(hs),
+		.vs(vs),
+		.pixel_clk(pixel_clk),
+		.blank(blank),
+		.sync(sync),
+		.DrawX(drawX),
+		.DrawY(drawY)
+	);
+	
+	font_rom fr0 (
+		.addr(index),
+		.data(charData)
+	);
+	
+	ram ram0 (
+		.address_a(AVL_ADDR),
+		.address_b(ram_read_address),
+		.byteena_a(AVL_BYTE_EN),
+		.byteena_b(),
+		.clock(CLK),
+		.data_a(AVL_WRITEDATA),
+		.data_b(),
+		.rden_a(1'b1),
+		.rden_b(1'b1),
+		.wren_a(AVL_CS & AVL_WRITE & ~AVL_ADDR[11]),
+		.wren_b(1'b0),
+		.q_a(),
+		.q_b(ram_output)
+	);
+  
+	
+// Read and write from AVL interface to register block, note that READ waitstate = 1, so this should be in always_ff
+//always_ff @(posedge CLK) begin
+//	if (AVL_CS) begin
+//		// WRITE
+//		if (AVL_WRITE) begin
+//			if (AVL_BYTE_EN[0])
+//				LOCAL_REG[AVL_ADDR][7:0] <= AVL_WRITEDATA[7:0];
+//			
+//			if (AVL_BYTE_EN[1])
+//				LOCAL_REG[AVL_ADDR][15:8] <= AVL_WRITEDATA[15:8];
+//				
+//			if (AVL_BYTE_EN[2])
+//				LOCAL_REG[AVL_ADDR][23:16] <= AVL_WRITEDATA[23:16];
+//				
+//			if (AVL_BYTE_EN[3])
+//				LOCAL_REG[AVL_ADDR][31:24] <= AVL_WRITEDATA[31:24];
+//		end
+//		
+//		// READ
+//		if (AVL_READ) begin
+//			AVL_READDATA[31:0] <= LOCAL_REG[AVL_ADDR][31:0];
+//		end
+//	end
+//end
+ 
+
+//handle drawing (may either be combinational or sequential - or both).
+
+always_comb begin
+	// xPos = drawX / 8;
+	address = (drawY[9:4] * 80 + drawX[9:3]);
+	ram_read_address = address[11:1];
+	
+//	case (xPos % 4)
+//		0: begin
+//			index = {(LOCAL_REG[address][6:0]), drawY[3:0]};
+//			inverse = LOCAL_REG[address][7];
+//		end
+//		1: begin
+//			index = {(LOCAL_REG[address][14:8]), drawY[3:0]};
+//			inverse = LOCAL_REG[address][15];
+//		end
+//		2: begin
+//			index = {(LOCAL_REG[address][22:16]), drawY[3:0]};
+//			inverse = LOCAL_REG[address][23];
+//		end
+//		3: begin
+//			index = {(LOCAL_REG[address][30:24]), drawY[3:0]};
+//			inverse = LOCAL_REG[address][31];
+//		end
+//	endcase
+	
+	case (address[0])
+		0: begin
+			index = {ram_output[14:8], drawY[3:0]};
+			inverse = ram_output[15];
+		end
+		1: begin
+			index = {ram_output[30:24], drawY[3:0]};
+			inverse = ram_output[31];
+		end
+	endcase
+	
+//	case (drawX[2:0])
+//		3'b000: currentBit = charData[0];
+//		3'b001: currentBit = charData[7];
+//		3'b010: currentBit = charData[6];
+//		3'b011: currentBit = charData[5];
+//		3'b100: currentBit = charData[4];
+//		3'b101: currentBit = charData[3];
+//		3'b110: currentBit = charData[2];
+//		3'b111: currentBit = charData[1];
+//	endcase
+
+	currentBit = charData[~drawX[2:0]];
+	
+	if (inverse) begin
+		currentBit = ~currentBit;
+	end
+end
+
+always_ff @(posedge pixel_clk) begin
+	if (!blank) begin
+		red <= 4'h0;
+		green <= 4'h0;
+		blue <= 4'h0;
+	end
+	
+	else begin
+//		red <= currentBit ? LOCAL_REG[`CTRL_REG][24:21] : LOCAL_REG[`CTRL_REG][12:9];
+//		green <= currentBit ? LOCAL_REG[`CTRL_REG][20:17] : LOCAL_REG[`CTRL_REG][8:5];
+//		blue <= currentBit ? LOCAL_REG[`CTRL_REG][16:13] : LOCAL_REG[`CTRL_REG][4:1];
+		case (address[0])
+			0: begin
+//				red 	<= currentBit ? PALETTE_REG[ram_output[7:4]][24:21] : PALETTE_REG[ram_output[3:0]][12:9];
+//				green <= currentBit ? PALETTE_REG[ram_output[7:4]][20:17] : PALETTE_REG[ram_output[3:0]][8:5];
+//				blue 	<= currentBit ? PALETTE_REG[ram_output[7:4]][16:13] : PALETTE_REG[ram_output[3:0]][4:1];
+				if (currentBit) begin
+					red	<= ram_output[4] ? PALETTE_REG[ram_output[7:5]][24:21] : PALETTE_REG[ram_output[7:5]][12:9];
+					green <= ram_output[4] ? PALETTE_REG[ram_output[7:5]][20:17] : PALETTE_REG[ram_output[7:5]][8:5];
+					blue 	<= ram_output[4] ? PALETTE_REG[ram_output[7:5]][16:13] : PALETTE_REG[ram_output[7:5]][4:1];
+				end
+				
+				else begin
+					red	<= ram_output[0] ? PALETTE_REG[ram_output[3:1]][24:21] : PALETTE_REG[ram_output[3:1]][12:9];
+					green <= ram_output[0] ? PALETTE_REG[ram_output[3:1]][20:17] : PALETTE_REG[ram_output[3:1]][8:5];
+					blue 	<= ram_output[0] ? PALETTE_REG[ram_output[3:1]][16:13] : PALETTE_REG[ram_output[3:1]][4:1];
+				end
+			end
+			1: begin
+//				red 	<= currentBit ? PALETTE_REG[ram_output[23:20]][24:21] : PALETTE_REG[ram_output[19:16]][12:9];
+//				green <= currentBit ? PALETTE_REG[ram_output[23:20]][20:17] : PALETTE_REG[ram_output[19:16]][8:5];
+//				blue 	<= currentBit ? PALETTE_REG[ram_output[23:20]][16:13] : PALETTE_REG[ram_output[19:16]][4:1];
+				if (currentBit) begin
+					red	<= ram_output[20] ? PALETTE_REG[ram_output[23:21]][24:21] : PALETTE_REG[ram_output[23:21]][12:9];
+					green <= ram_output[20] ? PALETTE_REG[ram_output[23:21]][20:17] : PALETTE_REG[ram_output[23:21]][8:5];
+					blue 	<= ram_output[20] ? PALETTE_REG[ram_output[23:21]][16:13] : PALETTE_REG[ram_output[23:21]][4:1];
+				end
+				
+				else begin
+					red	<= ram_output[16] ? PALETTE_REG[ram_output[19:17]][24:21] : PALETTE_REG[ram_output[19:17]][12:9];
+					green <= ram_output[16] ? PALETTE_REG[ram_output[19:17]][20:17] : PALETTE_REG[ram_output[19:17]][8:5];
+					blue 	<= ram_output[16] ? PALETTE_REG[ram_output[19:17]][16:13] : PALETTE_REG[ram_output[19:17]][4:1];
+				end
+			end
+		endcase
+	end
+end
+
+endmodule

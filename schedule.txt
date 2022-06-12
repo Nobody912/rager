@@ -1,0 +1,14 @@
+wed
+*character design + movement
+*obstacle generation (1 + 1 buffer system)
+*enemy design + movement (1 + 1 buffer system)
+
+thursday
+*collision layer
+*projectile
+*menu (start/stop + score)
+*parallax (save working codebase)
+
+friday
+*parallax (save working codebase)
+*
